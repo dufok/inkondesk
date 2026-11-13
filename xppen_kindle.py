@@ -4,7 +4,8 @@ Reads the XP-Pen driver config (%APPDATA%\\XPPen\\config.xml), follows the
 foreground app on Windows like the driver does, renders the remote's layout
 with your key labels, pushes it to the Kindle over USB networking (SSH) and
 handles taps on the Kindle: an on-screen numpad (0-9, sent to the active PC app),
-key group tabs and the frontlight buttons.
+key group tabs, the frontlight buttons and "calc", which turns the whole screen into
+a calculator (with % and a history of past calculations, kept across restarts).
 A watchdog on the Kindle shows the BadPrompt screensaver when the PC goes away.
 
 Meant to run permanently (pythonw, started at Windows logon): waits for the
@@ -35,8 +36,9 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException, localcontext
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(os.environ.get("APPDATA", ""), "XPPen", "config.xml")
@@ -47,7 +49,7 @@ HOST = "root@" + KINDLE_IP
 FONTS = "C:/Windows/Fonts/"
 LOG = os.path.join(HERE, "xppen_kindle.log")
 STOP_FLAG = os.path.join(HERE, "xppen_kindle.stop")
-STATE = os.path.join(HERE, "xppen_kindle_state.json")     # remembers the frontlight level
+STATE = os.path.join(HERE, "xppen_kindle_state.json")     # frontlight level, calculator history
 
 # PW1 frontlight: powerd flIntensity 0 (off) .. 24. Uneven steps: the eye notices low levels more.
 LIGHT_STEPS = [0, 1, 2, 4, 6, 9, 12, 16, 20, 24]
@@ -197,6 +199,223 @@ def foreground_exe():
         kernel32.CloseHandle(h)
 
 
+# --------------------------------------------------------------------------- calculator
+
+CALC_OPS = ("+", "−", "×", "÷")
+CALC_MAX_DIGITS = 15
+HISTORY_MAX = 50                 # calculations kept in the state file
+THIN = " "                  # thousands separator on screen: 1 234 567.5
+
+
+def calc_show(tok):
+    """Number or operator token -> screen text: thin-space thousands groups, a real minus sign."""
+    if tok in CALC_OPS:
+        return tok
+    neg = tok.startswith("-")
+    body = tok[1:] if neg else tok
+    pct = body.endswith("%")
+    body = body.rstrip("%")
+    if "e" not in body:
+        ip, dot, fp = body.partition(".")
+        groups = []
+        while len(ip) > 3:
+            groups.insert(0, ip[-3:])
+            ip = ip[:-3]
+        body = THIN.join([ip] + groups) + dot + fp
+    return ("−" if neg else "") + body + ("%" if pct else "")
+
+
+def calc_str(d):
+    """Result -> plain string: at most 15 significant digits and 10 decimals ('1437.5', '0.3333333333'),
+    exponent form for very big / very small numbers ('1.5e20')."""
+    with localcontext() as ctx:
+        ctx.prec = 15
+        d = +d
+    if d == 0:
+        return "0"
+    if abs(d) >= Decimal("1e15") or abs(d) < Decimal("1e-10"):
+        mant, _, exp = f"{d:.9e}".partition("e")
+        return mant.rstrip("0").rstrip(".") + "e" + str(int(exp))
+    return format(d.quantize(Decimal("1e-10")).normalize(), "f")
+
+
+def _factor(tok):
+    v = Decimal(tok.rstrip("%"))
+    return v / 100 if tok.endswith("%") else v
+
+
+def calc_eval(toks):
+    """[number, op, number, ...] -> Decimal. × and ÷ go before + and −. Percent works like on a
+    desk calculator: right after + or − it is a percent of what comes before (200 + 10% = 220,
+    200 − 10% = 180), anywhere else it is just /100 (50 × 10% = 5, 10% = 0.1)."""
+    with localcontext() as ctx:
+        ctx.prec = 34
+        total, sign, i = None, 1, 0
+        while i < len(toks):
+            term = [toks[i]]                       # one term: number (× or ÷ number)*
+            i += 1
+            while i < len(toks) and toks[i] in ("×", "÷"):
+                term += toks[i:i + 2]
+                i += 2
+            if total is not None and len(term) == 1 and term[0].endswith("%"):
+                val = total * Decimal(term[0][:-1]) / 100
+            else:
+                val = _factor(term[0])
+                for j in range(1, len(term), 2):
+                    v = _factor(term[j + 1])
+                    val = val * v if term[j] == "×" else val / v
+            total = val if total is None else total + sign * val
+            if i < len(toks):
+                sign = 1 if toks[i] == "+" else -1
+                i += 1
+        return total if total is not None else Decimal(0)
+
+
+class Calc:
+    """An ordinary calculator: + − × ÷, %, ±, C, ⌫ and a history of finished calculations.
+    Tokens are number strings ("12.5", "-3", "15%") and the operators in CALC_OPS."""
+
+    def __init__(self, history=()):
+        self.history = [h for h in history
+                        if isinstance(h, dict) and "expr" in h and "result" in h][-HISTORY_MAX:]
+        self.tokens = []
+        self.done = None          # (expression, result) right after "="
+        self.error = ""
+        self.rev = 0              # bumped on every change: the screen redraws when it moves
+
+    def _num(self):
+        """The number being typed (last token), or None after an operator / at the start."""
+        return self.tokens[-1] if self.tokens and self.tokens[-1] not in CALC_OPS else None
+
+    def _complete(self):
+        """Tokens without a trailing operator or a lone minus: something calc_eval can take."""
+        toks = list(self.tokens)
+        while toks and (toks[-1] in CALC_OPS or toks[-1] == "-"):
+            toks.pop()
+        return toks
+
+    def press(self, k):
+        self.rev += 1
+        if self.error:                                   # any key clears an error
+            self.error, self.tokens = "", []
+            if k in ("C", "⌫"):
+                return
+        if self.done:
+            if k == "=":
+                return
+            result, self.done = self.done[1], None
+            # an operator, %, ± or ⌫ goes on with the result; a digit starts a new calculation
+            self.tokens = [result] if k in CALC_OPS + ("%", "±", "⌫") else []
+        if k == "C":
+            self.tokens = []
+        elif k == "⌫":
+            self._backspace()
+        elif k.isdigit() or k == ".":
+            self._digit(k)
+        elif k in CALC_OPS:
+            self._operator(k)
+        elif k == "%":
+            t = self._num()
+            if t and t != "-" and not t.endswith("%"):
+                self.tokens[-1] = t.rstrip(".") + "%"
+        elif k == "±":
+            t = self._num()
+            if t is None:
+                self.tokens.append("-")
+            else:
+                t = t[1:] if t.startswith("-") else "-" + t
+                if t:
+                    self.tokens[-1] = t
+                else:
+                    self.tokens.pop()
+        elif k == "=":
+            self._equals()
+
+    def _digit(self, k):
+        t = self._num()
+        if t is None:
+            self.tokens.append("0." if k == "." else k)
+            return
+        if t.endswith("%") or "e" in t:                  # "15%" / "1.5e20" are finished numbers
+            return
+        if k == ".":
+            if "." not in t:
+                self.tokens[-1] = t + ("0." if t in ("", "-") else ".")
+            return
+        if sum(c.isdigit() for c in t) >= CALC_MAX_DIGITS:
+            return
+        self.tokens[-1] = t[:-1] + k if t in ("0", "-0") else t + k
+
+    def _operator(self, k):
+        if self.tokens and self.tokens[-1] == "-":       # a lone minus is dropped
+            self.tokens.pop()
+        if not self.tokens:
+            self.tokens = ["0"]
+        if self.tokens[-1] in CALC_OPS:                  # change your mind: replace the operator
+            self.tokens[-1] = k
+            return
+        if self.tokens[-1].endswith("."):
+            self.tokens[-1] = self.tokens[-1][:-1]
+        self.tokens.append(k)
+
+    def _backspace(self):
+        if not self.tokens:
+            return
+        t = self.tokens.pop()
+        if t in CALC_OPS or "e" in t:                    # operators and 1.5e20 go as a whole
+            return
+        t = t[:-1]
+        if t not in ("", "-"):
+            self.tokens.append(t)
+
+    def _equals(self):
+        toks = self._complete()
+        if not toks or (len(toks) == 1 and not toks[0].endswith("%")):
+            self.tokens = toks                           # nothing to calculate
+            return
+        expr = " ".join(calc_show(t) for t in toks)
+        try:
+            result = calc_str(calc_eval(toks))
+        except (DecimalException, ZeroDivisionError) as e:
+            self.tokens = toks
+            self.error = "Can't divide by 0" if isinstance(e, ZeroDivisionError) else "Error"
+            return
+        self.done, self.tokens = (expr, result), []
+        self.history.append({"expr": expr, "result": result})
+        del self.history[:-HISTORY_MAX]
+
+    def recall(self, i):
+        """Tap on a history line: its result becomes the number being typed."""
+        self.rev += 1
+        result = self.history[i]["result"]
+        if self.error or self.done:
+            self.error, self.done, self.tokens = "", None, []
+        if self._num() is not None:
+            self.tokens[-1] = result
+        else:
+            self.tokens.append(result)
+
+    def clear_history(self):
+        self.rev += 1
+        self.history = []
+
+    def display(self):
+        """(small line: the expression, big line: the number)."""
+        if self.error:
+            return " ".join(calc_show(t) for t in self.tokens), self.error
+        if self.done:
+            return self.done[0] + " =", calc_show(self.done[1])
+        if not self.tokens:
+            return "", "0"
+        if self.tokens[-1] in CALC_OPS:                  # after an operator: the running result
+            try:
+                big = calc_show(calc_str(calc_eval(self._complete())))
+            except (DecimalException, ZeroDivisionError):
+                big = ""
+            return " ".join(calc_show(t) for t in self.tokens), big
+        return " ".join(calc_show(t) for t in self.tokens[:-1]), calc_show(self.tokens[-1])
+
+
 # --------------------------------------------------------------------------- render
 
 @functools.lru_cache(maxsize=None)
@@ -242,6 +461,22 @@ def fit(d, text, width, height, size_max, size_min, bold):
     return f, lines[: max(1, height // int(size_min * 1.2))]
 
 
+def fit_one(d, text, width, size_max, size_min, bold, keep="end"):
+    """One line: the biggest font size that fits. If even size_min is too wide, cut the text
+    with "…", keeping its end (keep="end") or its start (keep="start")."""
+    for size in range(size_max, size_min - 1, -2):
+        f = font(bold, size)
+        if d.textlength(text, font=f) <= width:
+            return f, text
+    f = font(bold, size_min)
+    while len(text) > 1:
+        text = text[1:] if keep == "end" else text[:-1]
+        cut = "…" + text if keep == "end" else text + "…"
+        if d.textlength(cut, font=f) <= width:
+            return f, cut
+    return f, text
+
+
 def draw_lines(d, lines, f, cx, top, fill):
     lh = int(f.size * 1.2)
     for i, ln in enumerate(lines):
@@ -283,7 +518,7 @@ def draw_light(d, hits, x, y, light):
     h = 62
     draw_sun(d, x + 22, y + h // 2)
     x += 50
-    for action, label, w in (("down", "−", 88), ("bar", None, 170), ("up", "+", 88)):
+    for action, label, w in (("down", "−", 80), ("bar", None, 150), ("up", "+", 80)):
         if action == "bar":
             n = len(LIGHT_STEPS) - 1                       # segments for levels 1..max
             seg = (w - (n - 1) * 4) / n
@@ -297,15 +532,25 @@ def draw_light(d, hits, x, y, light):
             d.text((x + w // 2, y + h // 2 - 2), label, font=font(True, 44), fill=0, anchor="mm")
             hits.append((box, ("light", action)))
         x += w + 12
-    box = (x, y, x + 104, y + h)
+    box = (x, y, x + 96, y + h)
     off = light == 0
     d.rounded_rectangle(box, radius=12, outline=0, width=3, fill=0 if off else 255)
-    d.text((x + 52, y + h // 2), "on" if off else "off", font=font(True, 28),
+    d.text((x + 48, y + h // 2), "on" if off else "off", font=font(True, 28),
            fill=255 if off else 0, anchor="mm")
     hits.append((box, ("light", "toggle")))
-    return x + 104
+    return x + 96
 
 
+def draw_calc_button(d, hits, x, y, active):
+    """"calc" next to the frontlight controls: opens the calculator; black while it's open,
+    tap again to go back to the key map."""
+    box = (x, y, x + 116, y + 62)
+    d.rounded_rectangle(box, radius=12, outline=0, width=3, fill=0 if active else 255)
+    d.text((x + 58, y + 31), "calc", font=font(True, 30), fill=255 if active else 0, anchor="mm")
+    hits.append((box, ("calc",)))
+
+
+FOOTER_Y = 680          # bottom row: frontlight, calc, key groups
 MAP_X1 = 686            # the remote's key map: x 16..686 (left)
 PAD_X0 = 702            # our on-screen keys: x 702..1008 (right)
 
@@ -336,7 +581,7 @@ def draw_keypad(d, hits, x0, y0, x1, y1, gap=14):
 
 
 def render(profiles, shown, group, active_exe, light=1):
-    """Return (portrait image for the Kindle, hit regions in landscape coords).
+    """Key map screen. Return (landscape image, hit regions in landscape coords).
     light = index into LIGHT_STEPS (0 = off)."""
     img = Image.new("L", (LW, LH), 255)
     d = ImageDraw.Draw(img)
@@ -373,12 +618,14 @@ def render(profiles, shown, group, active_exe, light=1):
     for k, box in layout.items():
         draw_key(d, box, f"K{k}", keys[k - 1])
 
-    # --- footer: frontlight on the left, key groups on the right (only groups with something assigned)
-    fy = 680
-    draw_light(d, hits, 16, fy, light)
+    # --- footer: frontlight and calc on the left, key groups on the right
+    # (only groups with something assigned)
+    fy = FOOTER_Y
+    x = draw_light(d, hits, 16, fy, light)
+    draw_calc_button(d, hits, x + 16, fy, False)
     used = [g for g in range(4) if any(k.kind and k.kind != "func" for k in prof.groups[g])] or [0]
     if len(used) > 1:
-        w = 96
+        w = 96 if len(used) < 4 else 80
         x = LW - 16 - len(used) * (w + 10) + 10
         for g in used:
             box = (x, fy, x + w, fy + 62)
@@ -389,7 +636,92 @@ def render(profiles, shown, group, active_exe, light=1):
             hits.append((box, ("group", g)))
             x += w + 10
 
-    return img.rotate(90, expand=True), hits
+    return img, hits
+
+
+CALC_X1 = 560           # calculator display + history: x 16..560
+CALC_PAD_X0 = 576       # calculator keys: x 576..1008
+CALC_KEYS = ["C", "⌫", "%", "÷",
+             "7", "8", "9", "×",
+             "4", "5", "6", "−",
+             "1", "2", "3", "+",
+             "±", "0", ".", "="]
+
+
+def draw_backspace(d, cx, cy, fill=0):
+    pts = [(cx - 34, cy), (cx - 14, cy - 22), (cx + 32, cy - 22), (cx + 32, cy + 22), (cx - 14, cy + 22)]
+    d.line(pts + pts[:2], fill=fill, width=4, joint="curve")
+    d.line((cx - 1, cy - 10, cx + 19, cy + 10), fill=fill, width=4)
+    d.line((cx - 1, cy + 10, cx + 19, cy - 10), fill=fill, width=4)
+
+
+def draw_calc_key(d, box, label):
+    eq, op = label == "=", label in CALC_OPS
+    d.rounded_rectangle(box, radius=16, outline=0, width=3, fill=0 if eq else 222 if op else 255)
+    cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+    if label == "⌫":
+        draw_backspace(d, cx, cy)
+        return
+    size = 76 if label == "." else 60 if (label.isdigit() or op or eq) else 46
+    d.text((cx, cy - 4), label, font=font(True, size), fill=255 if eq else 0, anchor="mm")
+
+
+def render_calc(calc, light=1):
+    """Calculator screen. Return (landscape image, hit regions in landscape coords)."""
+    img = Image.new("L", (LW, LH), 255)
+    d = ImageDraw.Draw(img)
+    hits = []
+    x0, x1 = 16, CALC_X1
+
+    # --- display: the expression above, the number below, right-aligned like any calculator
+    d.rounded_rectangle((x0, 12, x1, 236), radius=14, outline=0, width=3, fill=255)
+    top, big = calc.display()
+    if top:
+        f, t = fit_one(d, top, x1 - x0 - 44, 34, 22, False, keep="end")
+        d.text((x1 - 22, 58), t, font=f, fill=100, anchor="rm")
+    f, t = fit_one(d, big, x1 - x0 - 44, 100, 36, True, keep="end")
+    d.text((x1 - 22, 160), t, font=f, fill=0, anchor="rm")
+
+    # --- history, newest first; tap a line to take its result
+    hy0, hy1 = 252, 660
+    d.rounded_rectangle((x0, hy0, x1, hy1), radius=14, outline=150, width=2, fill=255)
+    d.text((x0 + 20, hy0 + 30), "History", font=font(True, 24), fill=90, anchor="lm")
+    if calc.history:
+        b = (x1 - 118, hy0 + 8, x1 - 10, hy0 + 52)
+        d.rounded_rectangle(b, radius=10, outline=0, width=2, fill=255)
+        d.text(((b[0] + b[2]) // 2, (b[1] + b[3]) // 2), "clear", font=font(True, 22), fill=0, anchor="mm")
+        hits.append((b, ("calc_clear",)))
+    else:
+        d.text(((x0 + x1) // 2, (hy0 + 60 + hy1) // 2), "Finished calculations show up here",
+               font=font(False, 22), fill=150, anchor="mm")
+    row_h, y = 56, hy0 + 62
+    rows = (hy1 - 8 - y) // row_h
+    for i in range(len(calc.history) - 1, -1, -1)[:rows]:
+        h = calc.history[i]
+        d.line((x0 + 16, y, x1 - 16, y), fill=200, width=1)
+        rf, rt = fit_one(d, "= " + calc_show(h["result"]), (x1 - x0) // 2, 32, 20, True, keep="start")
+        d.text((x1 - 22, y + row_h // 2), rt, font=rf, fill=0, anchor="rm")
+        room = x1 - x0 - 44 - d.textlength(rt, font=rf) - 20
+        ef, et = fit_one(d, h["expr"], room, 24, 18, False, keep="start")
+        d.text((x0 + 22, y + row_h // 2), et, font=ef, fill=100, anchor="lm")
+        hits.append(((x0 + 8, y, x1 - 8, y + row_h), ("calc_hist", i)))
+        y += row_h
+
+    # --- keys
+    kx0, ky0, kx1, ky1, gap = CALC_PAD_X0, 12, LW - 16, 660, 12
+    cw_ = (kx1 - kx0 - 3 * gap) / 4
+    rh = (ky1 - ky0 - 4 * gap) / 5
+    for i, label in enumerate(CALC_KEYS):
+        c, r = i % 4, i // 4
+        b = (int(kx0 + c * (cw_ + gap)), int(ky0 + r * (rh + gap)),
+             int(kx0 + c * (cw_ + gap) + cw_), int(ky0 + r * (rh + gap) + rh))
+        draw_calc_key(d, b, label)
+        hits.append((b, ("calc_key", label)))
+
+    # --- footer: frontlight, calc (black = open; tap to go back to the key map)
+    x = draw_light(d, hits, 16, FOOTER_Y, light)
+    draw_calc_button(d, hits, x + 16, FOOTER_Y, True)
+    return img, hits
 
 
 SCREENSAVER_SRC = os.path.join(HERE, "assets", "badprompt.webp")
@@ -398,8 +730,7 @@ SCREENSAVER_PNG = os.path.join(HERE, "assets", "screensaver.png")
 
 def make_screensaver(src=SCREENSAVER_SRC):
     """Colour logo on a flat background -> black logo on white, glossy highlights kept light.
-    Returns the portrait image (same orientation as the key map)."""
-    from PIL import ImageChops
+    Returns the portrait image (as the Kindle shows it)."""
     im = Image.open(src).convert("RGB")
     w, h = im.size
     px = im.load()
@@ -425,6 +756,14 @@ def to_landscape(px, py):
     return LW - 1 - py, px
 
 
+def hit_test(hits, lx, ly, slop=6):
+    """The action of the button under a tap (a few px of slack around each button), or None."""
+    for (x0, y0, x1, y1), action in hits:
+        if x0 - slop <= lx <= x1 + slop and y0 - slop <= ly <= y1 + slop:
+            return action
+    return None
+
+
 # --------------------------------------------------------------------------- kindle
 
 SSH = ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -433,6 +772,7 @@ SSH = ["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
 RPATH = "export PATH=$PATH:/sbin:/usr/sbin:/mnt/us/usbnet/bin; "
 KD_DIR = "/mnt/us/kindle-dash"                       # our files on the Kindle
 WATCHDOG_LOCAL = os.path.join(HERE, "kindle-scripts", "watchdog.sh")
+SCREEN_LUA_LOCAL = os.path.join(HERE, "kindle-scripts", "screen.lua")
 # start the screensaver watchdog unless it is already running (pidfile + exe check);
 # "already running" exits 1 -- that's fine, so never let it fail the whole command
 WATCHDOG_START = (f"start-stop-daemon -S -q -b -m -p /tmp/kd_watchdog.pid -x /bin/sh "
@@ -474,16 +814,68 @@ def reachable():
         return False
 
 
-def push(img, flash=True, before=""):
-    """Send the image and draw it. flash=False: quick partial refresh (no black blink).
-    before: shell command run first in the same SSH call (e.g. set the frontlight)."""
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    r = kindle(RPATH + before + "cat > /tmp/xpmap.png && fbink -q " + ("-f " if flash else "")
-               + "-g file=/tmp/xpmap.png", data=buf.getvalue())
+def push(png, x=0, y=0, flash=True, before=""):
+    """One SSH call: run `before` (e.g. set the frontlight), then draw the PNG at x,y (portrait px).
+    flash=False: quick partial refresh (no black blink)."""
+    draw = (f"cat > /tmp/xpmap.png && fbink -q {'-f ' if flash else ''}-g file=/tmp/xpmap.png,x={x},y={y}"
+            if png else "true")
+    r = kindle(RPATH + before + draw, data=png)
     if r.returncode != 0:
         log("push failed:", r.stderr.decode(errors="replace").strip())
     return r.returncode == 0
+
+
+class Screen:
+    """Draws landscape pictures on the Kindle through one long-lived SSH session running
+    kindle-scripts/screen.lua: no SSH handshake (~0.3 s) per redraw. Only the part of the picture
+    that changed is sent and refreshed, unless flash=True (whole screen, flashing refresh).
+    Falls back to a one-shot SSH call if the session breaks."""
+
+    def __init__(self):
+        self.proc = None
+        self.last = None              # landscape picture now on the e-ink screen
+
+    def close(self):
+        if self.proc:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        self.proc = None
+
+    def _send(self, data):
+        if self.proc is None or self.proc.poll() is not None:
+            self.proc = subprocess.Popen(SSH + [RPATH + f"exec lua {KD_DIR}/screen.lua"],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+        reply = self.proc.stdout.readline()
+        if not reply.startswith(b"OK"):
+            raise OSError("screen.lua: " + (reply.decode(errors="replace").strip() or "session closed"))
+
+    def show(self, img, flash=False, before=""):
+        box = (0, 0, LW, LH)
+        if not flash and self.last is not None:
+            diff = ImageChops.difference(self.last, img).getbbox()
+            box = diff and (max(0, diff[0] - 4), max(0, diff[1] - 4),
+                            min(LW, diff[2] + 4), min(LH, diff[3] + 4))
+        png, x, y = b"", 0, 0
+        if box:
+            buf = io.BytesIO()
+            img.crop(box).rotate(90, expand=True).save(buf, format="PNG", compress_level=1)
+            png, x, y = buf.getvalue(), box[1], LW - box[2]     # landscape box -> portrait corner
+        cmd = before.encode()
+        try:
+            self._send(f"{len(png)} {x} {y} {int(flash)} {len(cmd)}\n".encode() + cmd + png)
+        except (OSError, ValueError) as e:
+            log(e, "- drawing with a one-shot SSH call instead")
+            self.close()
+            if not push(png, x, y, flash, before):
+                self.last = None
+                return False
+        self.last = img
+        return True
 
 
 FL_SYSFS = "/sys/devices/system/fl_tps6116x/fl_tps6116x0/fl_intensity"
@@ -500,18 +892,20 @@ def light_cmd(idx):
 
 
 def load_state():
+    """{"light": index, "light_on": index, "calc_history": [...]} -- {} before the first run."""
     try:
         with open(STATE, encoding="utf-8") as f:
             s = json.load(f)
-        return int(s.get("light", 1)), int(s.get("light_on", 1))
+        return s if isinstance(s, dict) else {}
     except (OSError, ValueError):
-        return None, None
+        return {}
 
 
-def save_state(light, light_on):
+def save_state(state):
     try:
-        with open(STATE, "w", encoding="utf-8") as f:
-            json.dump({"light": light, "light_on": light_on}, f)
+        with open(STATE + ".new", "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+        os.replace(STATE + ".new", STATE)
     except OSError as e:
         log("state save failed:", e)
 
@@ -543,13 +937,15 @@ def take_screen():
 
 
 def install_kindle_files():
-    """Copy the screensaver image and the watchdog script to the Kindle (atomic replace:
-    the running watchdog keeps reading its old file)."""
+    """Copy the screensaver image, the watchdog and the screen.lua drawing loop to the Kindle
+    (atomic replace: a running script keeps reading its old file)."""
     buf = io.BytesIO()
     make_screensaver().save(buf, format="PNG", optimize=True)
-    with open(WATCHDOG_LOCAL, "rb") as f:
-        wd = f.read().replace(b"\r\n", b"\n")
-    for name, data in (("screensaver.png", buf.getvalue()), ("watchdog.sh", wd)):
+    files = [("screensaver.png", buf.getvalue())]
+    for path in (WATCHDOG_LOCAL, SCREEN_LUA_LOCAL):
+        with open(path, "rb") as f:
+            files.append((os.path.basename(path), f.read().replace(b"\r\n", b"\n")))
+    for name, data in files:
         r = kindle(f"mkdir -p {KD_DIR} && cat > {KD_DIR}/{name}.new && mv {KD_DIR}/{name}.new {KD_DIR}/{name}",
                    data=data)
         if r.returncode != 0:
@@ -630,11 +1026,59 @@ def run_kindle():
     taps = queue.Queue()
     touch = Touch(taps)
     touch.start()
+    screen = Screen()
     profiles, mtime = load_profiles(), os.path.getmtime(CONFIG)
     group, shown_key, hits, last_prof = 0, None, [], None
     online, next_check, deliberate = False, 0.0, False
-    light, light_on = load_state()          # light: index into LIGHT_STEPS; light_on: level for "on"
+    state = load_state()
+    light = state.get("light")              # index into LIGHT_STEPS (None: not known yet)
+    light_on = state.get("light_on", 1)     # level "on" goes back to
+    calc = Calc(state.get("calc_history", []))
+    mode = "map"                            # "map" (XP-Pen keys) or "calc" (calculator)
     pending = ""                            # shell command to run with the next push (frontlight)
+
+    def remember():
+        state.update(light=light, light_on=light_on, calc_history=calc.history)
+        save_state(state)
+
+    def act(action):
+        """Handle one tap. Returns True when the screen layout changes (so the taps still
+        queued are handled after the redraw, against the new layout)."""
+        nonlocal light, light_on, pending, group, mode
+        kind = action[0]
+        if kind == "light":
+            lt = light if light is not None else 1
+            if action[1] == "up":
+                lt = min(lt + 1, len(LIGHT_STEPS) - 1)
+            elif action[1] == "down":
+                lt = max(lt - 1, 0)
+            elif action[1] == "toggle":
+                lt = 0 if lt else (light_on or 1)
+            light = lt
+            if lt:
+                light_on = lt
+            remember()
+            pending = light_cmd(light)          # applied with the (partial) redraw
+        elif kind == "key":
+            if not send_key(action[1]):
+                log(f"key {action[2]}: SendInput failed (admin app focused?)")
+        elif kind == "group":
+            group = action[1]
+            return True
+        elif kind == "calc":
+            mode = "map" if mode == "calc" else "calc"
+            return True
+        elif kind == "calc_key":
+            calc.press(action[1])
+            if action[1] == "=" and calc.done:
+                remember()                      # the history survives restarts
+        elif kind == "calc_hist":
+            calc.recall(action[1])
+        elif kind == "calc_clear":
+            calc.clear_history()
+            remember()
+        return False
+
     try:
         while not deliberate:
             try:
@@ -650,7 +1094,7 @@ def run_kindle():
                                 if light is None:              # first run: keep what the Kindle had
                                     light = current_light_idx()
                                     light_on = light or 1
-                                    save_state(light, light_on)
+                                    remember()
                                 pending = light_cmd(light)     # re-apply after a Kindle reboot
                             else:
                                 next_check = time.time() + 10
@@ -685,48 +1129,44 @@ def run_kindle():
                     if prof != last_prof:
                         group, last_prof = 0, prof
                     lt = light if light is not None else 1
-                    key = (prof, group, lt)
-                    # redraw only on a profile/group/light change, not on every focus change;
-                    # a light-only change uses a quick partial refresh (no black blink)
+                    if mode == "calc":
+                        key = ("calc", calc.rev, lt)
+                    else:
+                        key = ("map", prof, group, lt)
+                    # redraw only on a real change, not on every focus change. A new screen
+                    # (profile, group, map <-> calc) gets a full flashing refresh; anything else
+                    # (a light level, a calculator key) a quick partial one of the changed part only
                     if online and key != shown_key:
-                        flash = shown_key is None or key[:2] != shown_key[:2]
-                        img, hits = render(profiles, prof, group, profiles[prof].exe, lt)
-                        if push(img, flash=flash, before=pending):
+                        flash = (shown_key is None or key[0] != shown_key[0]
+                                 or (mode == "map" and key[1:3] != shown_key[1:3]))
+                        if mode == "calc":
+                            img, hits = render_calc(calc, lt)
+                        else:
+                            img, hits = render(profiles, prof, group, profiles[prof].exe, lt)
+                        if screen.show(img, flash=flash, before=pending):
                             shown_key, pending = key, ""
-                            log(f"shown: {profiles[prof].name} / group {GROUP_NAMES[group]} / "
-                                f"light {LIGHT_STEPS[lt]}")
+                            if mode == "map":
+                                log(f"shown: {profiles[prof].name} / group {GROUP_NAMES[group]} / "
+                                    f"light {LIGHT_STEPS[lt]}")
+                            elif flash:
+                                log(f"shown: calculator / light {LIGHT_STEPS[lt]}")
                         else:
                             online, next_check = False, 0.0      # re-check the link right away
 
                     try:
-                        px, py = taps.get(timeout=0.4)
+                        tap = taps.get(timeout=0.4)
                     except queue.Empty:
                         continue
-                    lx, ly = to_landscape(px, py)
-                    for (x0, y0, x1, y1), action in hits:
-                        if x0 - 8 <= lx <= x1 + 8 and y0 - 8 <= ly <= y1 + 8:
-                            if isinstance(action, tuple) and action[0] == "light":
-                                lt = light if light is not None else 1
-                                if action[1] == "up":
-                                    lt = min(lt + 1, len(LIGHT_STEPS) - 1)
-                                elif action[1] == "down":
-                                    lt = max(lt - 1, 0)
-                                elif action[1] == "toggle":
-                                    lt = 0 if lt else (light_on or 1)
-                                light = lt
-                                if lt:
-                                    light_on = lt
-                                save_state(light, light_on)
-                                pending = light_cmd(light)       # applied with the partial redraw
-                                break                            # keep shown_key: no full flash
-                            if isinstance(action, tuple) and action[0] == "key":
-                                if not send_key(action[1]):
-                                    log(f"key {action[2]}: SendInput failed (admin app focused?)")
-                                break
-                            if isinstance(action, tuple) and action[0] == "group":
-                                group = action[1]
-                                shown_key = None
+                    # handle every tap already waiting before redrawing (fast typing on the
+                    # calculator), unless one of them changes the layout
+                    while tap:
+                        action = hit_test(hits, *to_landscape(*tap))
+                        if action and act(action):
                             break
+                        try:
+                            tap = taps.get_nowait()
+                        except queue.Empty:
+                            tap = None
                 deliberate = True                              # stop flag found
             except KeyboardInterrupt:
                 deliberate = True
@@ -736,6 +1176,7 @@ def run_kindle():
                 time.sleep(3)
     finally:
         touch.stop()
+        screen.close()
         if os.path.exists(STOP_FLAG):
             os.remove(STOP_FLAG)
         # give the Kindle its normal UI back only on a deliberate stop (--stop / Ctrl+C);
@@ -768,8 +1209,16 @@ def main():
                     continue
                 img, _ = render(profiles, i, g, p.exe)
                 out = os.path.join(a.preview, f"{i}_{GROUP_NAMES[g]}.png")
-                img.rotate(-90, expand=True).save(out)    # saved landscape for easy viewing
+                img.save(out)                              # landscape, for easy viewing
                 print(out, "-", p.name, GROUP_NAMES[g])
+        calc = Calc([{"expr": calc_show("1250") + " + 15%", "result": "1437.5"},
+                     {"expr": "2 × 3 + 4", "result": "10"}])
+        for k in "1234.5×3+20%":
+            calc.press(k)
+        img, _ = render_calc(calc)
+        out = os.path.join(a.preview, "calc.png")
+        img.save(out)
+        print(out, "- calculator")
         return
     run_kindle()
 

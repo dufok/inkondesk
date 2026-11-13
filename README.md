@@ -17,11 +17,25 @@ and sits on the desk as a permanent e-ink screen. I use it as an **info display*
   no more digging through the driver's menus;
 - **right** — my own touch buttons, for now a 0–9 numpad: tap a digit → the PC presses that NumPad key in the
   active app (in Blender these are the 1/3/7 views, 5 toggles perspective/ortho);
-- **bottom** — frontlight `−` / `+` / `off`;
+- **bottom** — frontlight `−` / `+` / `off`, and `calc`;
+- **`calc`** — the whole screen becomes a calculator (tap `calc` again to go back to the key map, see below);
 - **PC off or asleep** — after a minute the Kindle shows a screensaver and turns the light off; when the PC is
   back, the screen comes back by itself.
 
 E-ink is a good fit: it doesn't glare, reads well in any light, and the picture stays even without power.
+
+### Calculator
+
+![The calculator: display and history on the left, keys on the right](assets/preview-calc.png)
+
+An ordinary calculator, drawn and computed by the PC program, so it works the same whatever app is active:
+
+- `+ − × ÷` with the usual order (`2 + 3 × 4 = 14`), `±`, `C` (clear), `⌫` (delete the last digit);
+- `%` works like on a desk calculator: after `+` or `−` it's a percent of what comes before
+  (`1250 + 15% = 1437.5`, `1490 − 20% = 1192`), anywhere else it's just /100 (`64 × 10% = 6.4`);
+- exact decimal arithmetic (`0.1 + 0.2 = 0.3`), up to 15 significant digits;
+- **history** of finished calculations, newest on top: tap a line to use its result in the next calculation;
+  `clear` empties it. The last 50 are kept in `xppen_kindle_state.json`, so they survive restarts.
 
 ![Screensaver while the PC is off](assets/preview-screensaver.png)
 
@@ -43,12 +57,14 @@ Where this lives in the code (`xppen_kindle.py`):
 |---|---|
 | list of on-screen buttons | `NUMPAD` (label + key code) |
 | how buttons are drawn and where to tap | `draw_keypad()` → adds `hits` with the action `("key", vk, label)` |
-| what happens on a tap | the `action[0] == "key"` branch in `run_kindle()` → `send_key(vk)` |
+| what happens on a tap | `act()` in `run_kindle()`: the `"key"` branch → `send_key(vk)` |
 | pressing a key in Windows | `send_key()` — `SendInput`; for combos press the modifiers, the key, then release in reverse order |
-| screen layout | `render()`, constants `MAP_X1`, `PAD_X0` |
+| screen layout | `render()`, constants `MAP_X1`, `PAD_X0`, `FOOTER_Y` |
+| a whole screen of its own (like the calculator) | `render_calc()` + a `mode` in `run_kindle()`, toggled by a footer button |
 
 What e-ink can't give you compared to a Stream Deck: colour icons (16 shades of gray only) and an instant visual
-response (a redraw takes ~0.3–1 s; the key press itself reaches the PC immediately).
+response. A small change (a digit on the calculator) shows up in ~0.3 s — mostly the panel itself; a whole new
+screen with a full flashing refresh takes ~1 s. The key press itself reaches the PC immediately.
 
 ## How it works
 
@@ -56,7 +72,7 @@ response (a redraw takes ~0.3–1 s; the key press itself reaches the PC immedia
  Windows PC                                         Kindle Paperwhite 1 (Linux, jailbroken)
  ──────────                                         ───────────────────────────────────────
  xppen_kindle.py (pythonw, in the background)       USBNetwork: network over USB + SSH (dropbear)
-  • reads %APPDATA%\XPPen\config.xml   ── PNG ──▶    fbink draws the image on the e-ink panel
+  • reads %APPDATA%\XPPen\config.xml   ── PNG ──▶    screen.lua → fbink draws it on the e-ink panel
   • watches the active window          ◀─ taps ──    cat /dev/input/event0 (touchscreen)
   • renders the screen (Pillow)        ─ heartbeat ▶ watchdog.sh: no signal for 60 s → screensaver
   • SendInput: keys into the active window
@@ -65,6 +81,9 @@ response (a redraw takes ~0.3–1 s; the key press itself reaches the PC immedia
 
 - While running, the Kindle is switched to full-screen mode: its own UI (`framework`), the top bar (`pillow`)
   and the window manager (`awesome`) are stopped — otherwise they draw over the image and catch the taps.
+- Pictures go through one long-lived SSH session running `screen.lua` (the Kindle has Lua 5.1), so a redraw
+  doesn't pay for an SSH handshake (~0.3 s); and only the rectangle that changed is sent and refreshed
+  (~0.04 s on the PC side). If that session breaks, a one-shot SSH call is used and it reconnects next time.
 - The program survives disconnects: it waits for the Kindle, takes the screen back after a Kindle reboot, logs
   errors to `xppen_kindle.log` and keeps running; a second copy exits by itself.
 - Frontlight: `lipc-set-prop com.lab126.powerd flIntensity N`; at 0 powerd still keeps the LEDs at the minimum,
@@ -103,6 +122,7 @@ response (a redraw takes ~0.3–1 s; the key press itself reaches the PC immedia
 | `assets/badprompt.webp` | colour logo for the screensaver (the program builds the black-and-white version) |
 | `assets/preview-*.png` | images for this README |
 | `kindle-scripts/watchdog.sh` | screensaver watchdog, installed on the Kindle into `/mnt/us/kindle-dash/` |
+| `kindle-scripts/screen.lua` | the drawing loop on the Kindle (receives PNGs over SSH, runs fbink); installed there too |
 | `kindle-scripts/dash_on.sh`, `dash_off.sh` | manually switch the Kindle's full-screen mode on / off |
 | `kindle-scripts/udhcpd.conf`, `usbnetwork.patch` | DHCP on the Kindle: config and the patch to the USBNetwork script |
 
@@ -112,7 +132,7 @@ response (a redraw takes ~0.3–1 s; the key press itself reaches the PC immedia
 kindle_start.cmd                      # in the background, no window
 kindle_stop.cmd                       # stop, give the Kindle its normal UI back
 python xppen_kindle.py                # in a console for debugging (Ctrl+C)
-python xppen_kindle.py --preview out  # only render PNGs of every profile
+python xppen_kindle.py --preview out  # only render PNGs of every profile and the calculator
 ```
 
 ## Not in the repository

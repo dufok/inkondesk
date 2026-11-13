@@ -2,6 +2,7 @@
 *.sh     text eol=lf
 *.conf   text eol=lf
 *.patch  text eol=lf
+*.lua    text eol=lf
 # Windows side
 *.cmd    text eol=crlf
 *.py     text eol=lf
