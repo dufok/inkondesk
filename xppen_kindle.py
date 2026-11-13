@@ -94,9 +94,9 @@ def _parse_key(node):
     if kind == "key":
         shortcut = _symbols(raw)
     elif kind == "mouse":
-        shortcut = "мышь"
+        shortcut = "mouse"
     elif kind == "func":
-        shortcut = "функция драйвера"
+        shortcut = "driver function"
     else:
         shortcut = "" if re.fullmatch(r"[\d+]*", raw) else _symbols(raw)
     return Key(kind, _symbols(label) if len(label) <= 2 else label, shortcut)
@@ -130,7 +130,7 @@ def load_profiles(path=CONFIG):
     dev = root.find("ACK05")
     if dev is None:
         raise SystemExit("ACK05 (Shortcut Remote) not found in " + path)
-    profiles = [_parse_app(dev.find("CommonAPP"), "Все программы", "")]
+    profiles = [_parse_app(dev.find("CommonAPP"), "All apps", "")]
     apps = dev.find("Apps")
     for app in (apps if apps is not None else []):
         exe = (app.findtext("path") or "").strip().lower()
@@ -279,7 +279,7 @@ def draw_sun(d, cx, cy, fill=0):
 
 
 def draw_light(d, hits, x, y, light):
-    """Frontlight control: sun, [−], level bar, [+], [выкл/вкл]. Returns right edge."""
+    """Frontlight control: sun, [−], level bar, [+], [off/on]. Returns right edge."""
     h = 62
     draw_sun(d, x + 22, y + h // 2)
     x += 50
@@ -300,7 +300,7 @@ def draw_light(d, hits, x, y, light):
     box = (x, y, x + 104, y + h)
     off = light == 0
     d.rounded_rectangle(box, radius=12, outline=0, width=3, fill=0 if off else 255)
-    d.text((x + 52, y + h // 2), "вкл" if off else "выкл", font=font(True, 28),
+    d.text((x + 52, y + h // 2), "on" if off else "off", font=font(True, 28),
            fill=255 if off else 0, anchor="mm")
     hits.append((box, ("light", "toggle")))
     return x + 104
@@ -321,7 +321,7 @@ def draw_keypad(d, hits, x0, y0, x1, y1, gap=14):
     """Our own on-screen keys (right column)."""
     box = (x0, 12, x1, 84)
     d.rounded_rectangle(box, radius=14, outline=150, width=2, fill=255)
-    d.text(((x0 + x1) // 2, 48), "Цифры · NumPad", font=font(True, 26), fill=90, anchor="mm")
+    d.text(((x0 + x1) // 2, 48), "NumPad", font=font(True, 26), fill=90, anchor="mm")
     cols, rows = 3, 4
     cw_ = (x1 - x0 - (cols - 1) * gap) / cols
     rh = (y1 - y0 - (rows - 1) * gap) / rows
@@ -633,7 +633,7 @@ def run_kindle():
     profiles, mtime = load_profiles(), os.path.getmtime(CONFIG)
     group, shown_key, hits, last_prof = 0, None, [], None
     online, next_check, deliberate = False, 0.0, False
-    light, light_on = load_state()          # light: index into LIGHT_STEPS; light_on: level for "вкл"
+    light, light_on = load_state()          # light: index into LIGHT_STEPS; light_on: level for "on"
     pending = ""                            # shell command to run with the next push (frontlight)
     try:
         while not deliberate:
