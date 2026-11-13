@@ -1,0 +1,24 @@
+--- a/usbnet/bin/usbnetwork
++++ b/usbnet/bin/usbnetwork
+@@ -136,6 +136,8 @@
+             fi
+         fi
+ 
++        # [kindle-dash] stop our DHCP server
++        killall udhcpd 2>/dev/null
+         # Stop USB Network IF
+         kh_msg "bringing usb0 interface down" I q
+         ifconfig usb0 down || exit 0
+@@ -297,6 +299,12 @@
+             sleep 5
+         fi
+ 
++        # [kindle-dash] DHCP for the host PC, so any USB port works without setting an IP by hand
++        if [ -f /mnt/us/usbnet/etc/udhcpd.conf ] ; then
++            killall udhcpd 2>/dev/null
++            /usr/sbin/udhcpd /mnt/us/usbnet/etc/udhcpd.conf
++        fi
++
+         # Start telnet & ssh daemons
+         [ -x ${USBNET_BINDIR}/busybox ] || chmod +x ${USBNET_BINDIR}/busybox
+         # Kill stale pidfile before starting

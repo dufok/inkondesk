@@ -1,0 +1,11 @@
+# Files that run on the Kindle must keep Unix line endings (a CR breaks the shell scripts)
+*.sh     text eol=lf
+*.conf   text eol=lf
+*.patch  text eol=lf
+# Windows side
+*.cmd    text eol=crlf
+*.py     text eol=lf
+*.md     text eol=lf
+# Binary assets
+*.webp   binary
+*.png    binary

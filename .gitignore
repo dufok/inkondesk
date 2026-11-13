@@ -1,0 +1,18 @@
+# Downloads (firmware, jailbreak, hotfix, KUAL, MRPI, USBNetwork, drivers) — ~500 MB, all re-downloadable,
+# and the PRIVATE SSH key for the Kindle (kindle-files/ssh/kindle_ed25519) — never commit it.
+kindle-files/
+
+# Full copies of NiLuJe's USBNetwork script (third-party) — the repo keeps only our patch
+kindle-scripts/usbnetwork
+kindle-scripts/usbnetwork.orig
+
+# Runtime files of xppen_kindle.py
+xppen_kindle.log
+xppen_kindle.log.old
+xppen_kindle.stop
+xppen_kindle_state.json
+assets/screensaver.png
+
+# Python
+__pycache__/
+*.pyc
